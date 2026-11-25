@@ -8,8 +8,8 @@ const newChecks = checkLibrary.checks.filter(c => c.addedIn === '2.0.0').length
 
 export const metadata: Metadata = pageMetadata(
   '/whats-new',
-  "What's new in Agent Verify 2.0",
-  `Agent Verify 2.0: ${checkLibrary.total} checks (${newChecks} new), PR checks for GitHub, GitLab and Bitbucket, VS Code and MCP, Agent Guard, a Team plan, and the State of MCP Security report.`,
+  "What's new in Agent Verify 2.1",
+  `Agent Verify 2.1: a guard for Claude Code and Cursor, company rules, approvals from your phone, 18 OWASP-mapped injection tests and verified agent profiles. Plus everything from 2.0: ${checkLibrary.total} checks, PR checks for GitHub, GitLab and Bitbucket, VS Code and MCP, and Agent Guard.`,
 )
 
 type Item = { title: string; text: string; href: string; cta: string; badge?: string }
@@ -38,7 +38,7 @@ const GROUPS: Array<{ title: string; intro: string; items: Item[] }> = [
     title: 'Protect what runs',
     intro: 'Controls for agents in production.',
     items: [
-      { title: 'Guard for Claude Code and Cursor', text: 'One command, npx agentverify protect, checks every command, file read, edit and MCP call your AI coding agent makes. It blocks reading .env files and keys, sending secrets out, deleting whole folders and force-pushing to main, and asks before installs and deploys.', href: '/docs#coding-agents', cta: 'Protect your coding agent', badge: 'New' },
+      { title: 'Guard for Claude Code and Cursor', text: 'One command, npx agentverify@latest protect, checks every command, file read, edit and MCP call your AI coding agent makes. It blocks reading .env files and keys, sending secrets out, deleting whole folders and force-pushing to main, and asks before installs and deploys.', href: '/docs#coding-agents', cta: 'Protect your coding agent', badge: 'New' },
       { title: 'Company rules and approvals from your phone', text: 'Set the rules once for the whole team. When an agent needs a person and nobody is at the screen, it pauses until someone taps Approve or Deny on the dashboard. Team owners see every member’s activity live.', href: '/docs#coding-agents', cta: 'Set up company rules', badge: 'New' },
       { title: 'Verified agent profiles', text: 'A public, signed page and live badge per agent with its scan, injection-test results and runtime protection, so customers can check it themselves.', href: '/docs#agent-profiles', cta: 'Create a profile', badge: 'New' },
       { title: 'Agent Guard', text: 'Runtime rules for JavaScript/TypeScript agents: allow and deny lists, human approval for risky tools, allowed domains, rate limits, and blocking keys from leaving.', href: '/developers#guard', cta: 'Add Agent Guard' },
@@ -63,8 +63,8 @@ export default function WhatsNewPage() {
   return (
     <main style={{ backgroundColor: 'var(--bg)' }} className="min-h-screen px-4 py-12 md:px-6 md:py-16">
       <div className="mx-auto max-w-5xl">
-        <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[color:var(--accent-purple-text)]">Agent Verify 2.0</p>
-        <h1 style={{ color: 'var(--text-primary)' }} className="mt-2 text-3xl font-semibold tracking-tight md:text-5xl">What&apos;s new in 2.0</h1>
+        <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[color:var(--accent-purple-text)]">Agent Verify 2.1</p>
+        <h1 style={{ color: 'var(--text-primary)' }} className="mt-2 text-3xl font-semibold tracking-tight md:text-5xl">What&apos;s new in 2.1</h1>
         <p style={{ color: 'var(--text-secondary)' }} className="mt-4 max-w-3xl text-lg leading-8">
           Agent Verify now checks AI agents everywhere they are built and run — in your editor, on every pull request, and in production — with {checkLibrary.total} tested checks.
         </p>

@@ -4,9 +4,12 @@
  * cannot understand is let through to the agent's own permission prompts.
  *
  * `agentverify protect [claude-code|cursor] [--global]` — one-time setup that installs those hooks.
+ *
+ * `agentverify log [--all] [-n N] [--json] [--path]` — shows the guard's recent decisions, saved on this computer.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, unlinkSync, renameSync } from 'fs'
 import { createHash } from 'crypto'
+import { spawnSync } from 'child_process'
 import { homedir, hostname } from 'os'
 import { dirname, join, resolve, basename } from 'path'
 import { CURSOR_WRITE_TOOLS, wantsRemoteApproval, buildPolicy, claudeCodeResponse, combine, cursorResponse, evaluate, forUnattended, fromClaudeCode, fromCursor, previewAction, type AgentAction, type CompanyPolicyFile, type PolicyFile, type Verdict } from './codingGuard'
@@ -16,6 +19,115 @@ const API_BASE = (process.env.AGENTVERIFY_API_URL ?? 'https://agentverify-api.ag
 const HOME_DIR = join(homedir(), '.agentverify')
 const QUEUE = join(HOME_DIR, 'activity-queue.jsonl')
 const FLUSH_AT = 25
+
+// ------------------------------------------------------------------------------------------------
+// Local log: every decision is kept on this computer, account or not. Read it with `agentverify log`.
+// ------------------------------------------------------------------------------------------------
+
+/** One guard decision, as saved locally and as sent to the dashboard. argsPreview is already masked. */
+export interface GuardLogEvent { agent: string; tool: string; decision: string; reason: string; argsPreview: string; at: string }
+
+export const LOCAL_LOG = join(HOME_DIR, 'guard-log.jsonl')
+/** When the log passes this size it becomes guard-log.old.jsonl (replacing any older one) and a new log starts. */
+export const LOCAL_LOG_MAX_BYTES = 1_000_000
+const oldLogPath = (path: string) => path.replace(/\.jsonl$/, '') + '.old.jsonl'
+
+/** Adds decisions to the local log. Never throws: the log must never block or slow down the agent. */
+export function appendLocalLog(events: GuardLogEvent[], opts: { path?: string; maxBytes?: number } = {}): void {
+  if (process.env.AGENTVERIFY_LOCAL_LOG === 'off' || !events.length) return
+  const path = opts.path ?? LOCAL_LOG
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    if (existsSync(path) && statSync(path).size > (opts.maxBytes ?? LOCAL_LOG_MAX_BYTES)) renameSync(path, oldLogPath(path))
+    appendFileSync(path, events.map(e => JSON.stringify(e)).join('\n') + '\n')
+  } catch { /* best effort */ }
+}
+
+/** Reads the local log, oldest first (the rotated file, then the current one). Damaged lines are skipped. */
+export function readLocalLog(path: string = LOCAL_LOG): GuardLogEvent[] {
+  const out: GuardLogEvent[] = []
+  for (const p of [oldLogPath(path), path]) {
+    if (!existsSync(p)) continue
+    let text = ''
+    try { text = readFileSync(p, 'utf8') } catch { continue }
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const e = JSON.parse(line)
+        if (e && typeof e.decision === 'string' && typeof e.at === 'string') out.push(e)
+      } catch { /* skip a damaged line */ }
+    }
+  }
+  return out
+}
+
+const DECISION_LABEL: Record<string, string> = { blocked: 'Blocked', asked: 'Asked you', allowed: 'Allowed', approved: 'Approved by a person', rejected: 'Denied by a person' }
+
+/** Plain-English lines for `agentverify log`: newest first, allowed actions only with --all. */
+export function formatLocalLog(events: GuardLogEvent[], opts: { all?: boolean; limit?: number; logPath?: string; time?: (iso: string) => string } = {}): string[] {
+  const time = opts.time ?? (iso => {
+    const d = new Date(iso)
+    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+  })
+  const limit = opts.limit ?? 20
+  const where = opts.logPath ?? LOCAL_LOG
+  if (!events.length) {
+    return [
+      'No guard decisions saved on this computer yet.',
+      'Run "npx agentverify@latest protect" in a project, then use Claude Code or Cursor as usual.',
+    ]
+  }
+  const shown = events.filter(e => opts.all || e.decision !== 'allowed')
+  const recent = shown.slice(-limit).reverse()
+  const counts = events.reduce<Record<string, number>>((acc, e) => ({ ...acc, [e.decision]: (acc[e.decision] ?? 0) + 1 }), {})
+  const summary = ['blocked', 'asked', 'rejected', 'approved', 'allowed'].filter(k => counts[k]).map(k => `${counts[k]} ${k}`).join(' · ')
+  const lines = [`Agent Verify guard log (${summary}) — ${where}`, '']
+  if (!recent.length) {
+    lines.push('Nothing was blocked or asked about. Everything was allowed.', 'Show allowed actions too: agentverify log --all')
+    return lines
+  }
+  for (const e of recent) {
+    lines.push(`${time(e.at)}  ${DECISION_LABEL[e.decision] ?? e.decision}  ${e.agent}`)
+    if (e.argsPreview) lines.push(`    ${e.argsPreview}`)
+    if (e.reason) lines.push(`    ${e.reason}`)
+    lines.push('')
+  }
+  const hidden = shown.length - recent.length
+  if (hidden > 0) lines.push(`${hidden} older ${hidden === 1 ? 'entry' : 'entries'} not shown. Show more: agentverify log -n ${Math.min(shown.length, 500)}`)
+  if (!opts.all && counts.allowed) lines.push(`Show allowed actions too: agentverify log --all`)
+  return lines
+}
+
+/** `agentverify log`: print the local guard log. */
+export function runLog(argv: string[], print: (s: string) => void, opts: { path?: string } = {}): number {
+  const path = opts.path ?? LOCAL_LOG
+  let all = false, json = false, limit = 20
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--all' || a === '-a') all = true
+    else if (a === '--json') json = true
+    else if (a === '--path') { print(path); return 0 }
+    else if (a === '-n' || a === '--limit') {
+      const n = Number(argv[++i])
+      if (!Number.isInteger(n) || n < 1) { print('Usage: agentverify log [--all] [-n <number>] [--json] [--path]'); return 1 }
+      limit = Math.min(n, 5000)
+    } else if (a === '--help' || a === '-h') {
+      print('Usage: agentverify log [--all] [-n <number>] [--json] [--path]')
+      print('  Shows what the guard blocked or asked about on this computer, newest first.')
+      print('  --all      include allowed actions     -n <number>  how many to show (default 20)')
+      print('  --json     one JSON object per line     --path       print where the log is saved')
+      print('  The log never leaves this computer. Turn it off with AGENTVERIFY_LOCAL_LOG=off.')
+      return 0
+    } else { print(`Unknown option: ${a}`); print('Usage: agentverify log [--all] [-n <number>] [--json] [--path]'); return 1 }
+  }
+  const events = readLocalLog(path)
+  if (json) {
+    for (const e of events.filter(e => all || e.decision !== 'allowed').slice(-limit)) print(JSON.stringify(e))
+    return 0
+  }
+  for (const line of formatLocalLog(events, { all, limit, logPath: path })) print(line)
+  return 0
+}
 
 async function readStdin(timeoutMs = 3000): Promise<string> {
   return new Promise(resolveRead => {
@@ -70,7 +182,7 @@ export async function loadCompanyPolicy(opts: { now?: number; fetchImpl?: typeof
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 1500)
   try {
-    const res = await (opts.fetchImpl ?? fetch)(`${API_BASE}/v1/guard/policy`, { signal: ctrl.signal, headers: { Authorization: `Bearer ${key}`, 'User-Agent': 'agentverify-coding-guard/2.1.0' } })
+    const res = await (opts.fetchImpl ?? fetch)(`${API_BASE}/v1/guard/policy`, { signal: ctrl.signal, headers: { Authorization: `Bearer ${key}`, 'User-Agent': 'agentverify-coding-guard/2.1.5' } })
     if (res.ok) {
       const body = (await res.json()) as { policy?: CompanyPolicyFile | null }
       const policy = body && typeof body.policy === 'object' ? body.policy ?? null : null
@@ -100,7 +212,7 @@ export async function requestRemoteApproval(req: { agent: string; tool: string; 
   const f = opts.fetchImpl ?? fetch
   const now = opts.now ?? Date.now
   const sleep = opts.sleep ?? (ms => new Promise(r => setTimeout(r, ms)))
-  const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'agentverify-coding-guard/2.1.0' }
+  const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'agentverify-coding-guard/2.1.5' }
   const call = async (path: string, init: RequestInit = {}) => {
     const ctrl = new AbortController()
     const t = setTimeout(() => ctrl.abort(), 5000)
@@ -131,13 +243,21 @@ export async function requestRemoteApproval(req: { agent: string; tool: string; 
 const LOG_DECISION: Record<Verdict['decision'], string> = { allow: 'allowed', deny: 'blocked', ask: 'asked' }
 
 /** Activity goes to the Agent Guard dashboard when an API key is set. Allowed actions are batched to stay fast. */
+/** Which coding agent this hook is running for. Cursor also runs Claude Code's hooks, so check the input, not only the target. */
+let startedByCursor = false
+function agentApp(target: HookTarget): string {
+  return target === 'cursor' || startedByCursor ? 'Cursor' : 'Claude Code'
+}
+
 async function logActivity(target: HookTarget, actions: AgentAction[], verdict: Verdict, project: string, decisionOverride?: string): Promise<void> {
+  const agent = `${agentApp(target)} · ${project} · ${hostname().slice(0, 40)}`
+  // A write and its contents are one action in the log.
+  const events: GuardLogEvent[] = actions.filter(a => a.kind !== 'code' || actions.length === 1).map(a => ({ agent, tool: a.agentTool ?? a.kind, decision: decisionOverride ?? LOG_DECISION[verdict.decision], reason: verdict.rule ? `${verdict.reason} (rule ${verdict.rule})` : verdict.reason, argsPreview: previewAction(a), at: new Date().toISOString() }))
+  // Always kept on this computer (no account needed); `agentverify log` reads it.
+  appendLocalLog(events)
   const key = process.env.AGENTVERIFY_API_KEY
   if (!key || process.env.AGENTVERIFY_GUARD_LOG === 'off') return
-  const agent = `${target === 'cursor' ? 'Cursor' : 'Claude Code'} · ${project} · ${hostname().slice(0, 40)}`
-  // A write and its contents are one action in the log.
-  const events = actions.filter(a => a.kind !== 'code' || actions.length === 1).map(a => ({ agent, tool: a.agentTool ?? a.kind, decision: decisionOverride ?? LOG_DECISION[verdict.decision], reason: verdict.rule ? `${verdict.reason} (rule ${verdict.rule})` : verdict.reason, argsPreview: previewAction(a), at: new Date().toISOString() }))
-  let batch = events
+  let batch: GuardLogEvent[] = events
   try {
     mkdirSync(HOME_DIR, { recursive: true })
     if (verdict.decision === 'allow') {
@@ -152,7 +272,7 @@ async function logActivity(target: HookTarget, actions: AgentAction[], verdict: 
   try {
     const ctrl = new AbortController()
     const t = setTimeout(() => ctrl.abort(), 1500)
-    const res = await fetch(`${API_BASE}/v1/guard/events`, { method: 'POST', signal: ctrl.signal, headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'agentverify-coding-guard/2.1.0' }, body: JSON.stringify({ events: batch.slice(-100) }) })
+    const res = await fetch(`${API_BASE}/v1/guard/events`, { method: 'POST', signal: ctrl.signal, headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'agentverify-coding-guard/2.1.5' }, body: JSON.stringify({ events: batch.slice(-100) }) })
     clearTimeout(t)
     if (res.ok && existsSync(QUEUE)) unlinkSync(QUEUE)
   } catch { /* offline: the queue is kept and sent next time */ }
@@ -170,6 +290,7 @@ export async function runHook(target: string | undefined): Promise<number> {
     return 0
   }
   const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd()
+  startedByCursor = typeof input.cursor_version === 'string'
   const { file } = loadPolicyFile(cwd)
   const company = await loadCompanyPolicy()
   const { policy } = buildPolicy(file, company.policy)
@@ -181,7 +302,7 @@ export async function runHook(target: string | undefined): Promise<number> {
   let verdict = combine(actions.map(a => evaluate(a, policy)))
   const permissionMode = typeof input.permission_mode === 'string' ? input.permission_mode : undefined
   const event = String(input.hook_event_name ?? '')
-  const agentLabel = `${target === 'cursor' ? 'Cursor' : 'Claude Code'} · ${basename(cwd)} · ${hostname().slice(0, 40)}`
+  const agentLabel = `${agentApp(target)} · ${basename(cwd)} · ${hostname().slice(0, 40)}`
   // Nobody at the screen, and the rules say a person decides on the dashboard: ask there and wait.
   if (wantsRemoteApproval(verdict, policy, { target, permissionMode, event })) {
     const main = actions.find(a => a.kind !== 'code') ?? actions[0]
@@ -194,7 +315,7 @@ export async function runHook(target: string | undefined): Promise<number> {
       : `${base} It needs a person's OK and the Agent Verify dashboard could not be reached, so it was blocked. Ask the user.`
     if (target === 'cursor') process.stdout.write(JSON.stringify(event === 'beforeReadFile' ? { permission: approved ? 'allow' : 'deny', ...(approved ? {} : { user_message: why }) } : { permission: approved ? 'allow' : 'deny', user_message: why, agent_message: why }))
     else process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: approved ? 'allow' : 'deny', permissionDecisionReason: why } }))
-    if (!(target === 'claude-code' && typeof input.cursor_version === 'string' && cursorHooksInstalled(cwd))) {
+    if (!(target === 'claude-code' && approved && insideCursorWithItsOwnHooks(input, cwd))) {
       await logActivity(target, actions, { decision: approved ? 'allow' : 'deny', rule: verdict.rule, reason: why.replace(/^Agent Verify: /, '') }, basename(cwd), approved ? 'approved' : outcome === 'denied' ? 'rejected' : 'blocked')
     }
     return 0
@@ -207,9 +328,11 @@ export async function runHook(target: string | undefined): Promise<number> {
     const out = claudeCodeResponse(verdict)
     if (out) process.stdout.write(out)
   }
-  // Cursor also runs Claude Code's project hooks. When Cursor's own hooks are installed too, they do the recording,
-  // so the same action isn't recorded twice. The answer above still counts: the strictest one wins.
-  if (target === 'claude-code' && typeof input.cursor_version === 'string' && cursorHooksInstalled(cwd)) return 0
+  // Cursor also runs Claude Code's project hooks. When Cursor's own hooks are installed too, they record what they see,
+  // so this hook stays quiet to avoid recording an action twice. But a block here stops the action before Cursor's
+  // own read/shell hooks run, so this hook must record its own blocks (file edits excepted: Cursor's preToolUse hook
+  // checks those too and records its blocks). The answer above still counts: the strictest one wins.
+  if (target === 'claude-code' && insideCursorWithItsOwnHooks(input, cwd) && (verdict.decision !== 'deny' || actions.some(a => a.kind === 'write'))) return 0
   // A Cursor edit is recorded once, by afterFileEdit; preToolUse only records the edits it stopped.
   if (target === 'cursor' && input.hook_event_name === 'preToolUse' && verdict.decision !== 'deny') return 0
   await logActivity(target, actions, verdict, basename(cwd))
@@ -238,14 +361,27 @@ export function hasGlobalInstall(pathEnv = process.env.PATH ?? ''): boolean {
   return pathEnv.split(process.platform === 'win32' ? ';' : ':').some(dir => dir && names.some(n => existsSync(join(dir, n))))
 }
 
+/** The version the `agentverify` found on the PATH reports, or null (none, or it didn't answer in time). */
+export function installedVersion(run: (cmd: string) => string | null = cmd => {
+  const r = spawnSync(`${cmd} --version`, { shell: true, timeout: 5000, encoding: 'utf8', windowsHide: true })
+  return r.status === 0 ? `${r.stdout ?? ''}` : null
+}): string | null {
+  const out = run('agentverify')
+  const m = out?.match(/(\d+\.\d+\.\d+)/)
+  return m ? m[1] : null
+}
+
 /**
- * The command the hooks run. A missing command would make the coding agent skip the check silently, so
- * it is the installed CLI only when one is really on the PATH; otherwise a version-pinned npx call.
+ * The command the hooks run. A missing or old command would make the coding agent skip the check silently (an
+ * old global install has no "hook" command), so it is the installed CLI only when it is this exact version;
+ * otherwise a version-pinned npx call.
  */
-export function hookCommand(version: string): string {
-  if (process.env.AGENTVERIFY_HOOK_NPX === '1') return `npx -y agentverify@${version}`
+export function hookCommand(version: string, installed: () => string | null = installedVersion): string {
+  const pinned = `npx -y agentverify@${version}`
+  if (process.env.AGENTVERIFY_HOOK_NPX === '1') return pinned
   const runningFromNpx = /[\\/]_npx[\\/]/.test(process.argv[1] ?? '')
-  return !runningFromNpx && hasGlobalInstall() ? 'agentverify' : `npx -y agentverify@${version}`
+  if (runningFromNpx || !hasGlobalInstall()) return pinned
+  return installed() === version ? 'agentverify' : pinned
 }
 
 /** Long enough for a person to answer an approval (the guard itself waits 120 seconds at most). */
@@ -269,6 +405,11 @@ export function installClaudeCode(root: string, cmd: string): { path: string; ch
 }
 
 /** True when Agent Verify's Cursor hooks are set up for this folder (or a parent) or for the whole machine. */
+/** This Claude Code hook was started by Cursor (Cursor runs Claude Code's project hooks too) and Cursor's own hooks are set up. */
+function insideCursorWithItsOwnHooks(input: Record<string, unknown>, cwd: string): boolean {
+  return typeof input.cursor_version === 'string' && cursorHooksInstalled(cwd)
+}
+
 export function cursorHooksInstalled(cwd: string): boolean {
   const has = (p: string) => { try { return readFileSync(p, 'utf8').includes('hook cursor') } catch { return false } }
   for (let dir = resolve(cwd); ; dir = dirname(dir)) {
@@ -313,6 +454,9 @@ export async function runProtect(argv: string[], version: string, print: (s: str
   const which = argv.find(a => a === 'claude-code' || a === 'cursor')
   const root = global ? homedir() : process.cwd()
   const cmd = hookCommand(version)
+  // An old global install would otherwise go unnoticed (and makes "npx agentverify" run it instead of the latest).
+  const found = cmd === 'agentverify' || !hasGlobalInstall() ? null : installedVersion()
+  const oldGlobal = found && found !== version ? found : null
   const done: string[] = []
   try {
     if (!which || which === 'claude-code') { const r = installClaudeCode(root, cmd); done.push(`${r.changed ? 'Added' : 'Already set up'}: Claude Code  (${r.path})`) }
@@ -334,8 +478,11 @@ export async function runProtect(argv: string[], version: string, print: (s: str
     'pushing to main, CI edits, and MCP tools that delete, pay or send.',
     '',
     `Try it:  echo '{"tool_name":"Bash","tool_input":{"command":"cat .env"}}' | ${cmd} hook claude-code`,
-    process.env.AGENTVERIFY_API_KEY ? 'Activity is sent to your Agent Guard dashboard.' : 'Set AGENTVERIFY_API_KEY to see every action in your Agent Guard dashboard.',
-    cmd === 'agentverify' ? '' : 'Tip: run "npm install -g agentverify" so each check starts faster, then run protect again.',
+    `See what was blocked:  ${cmd === 'agentverify' ? 'agentverify' : 'npx agentverify@latest'} log   (saved on this computer)`,
+    process.env.AGENTVERIFY_API_KEY ? 'Activity is also sent to your Agent Guard dashboard.' : 'Set AGENTVERIFY_API_KEY to also see every action in your Agent Guard dashboard.',
+    cmd === 'agentverify' ? '' : oldGlobal
+      ? `Note: an older Agent Verify (${oldGlobal}) is installed on this computer. The hooks use ${version} instead. To update it: npm install -g agentverify@latest`
+      : 'Tip: run "npm install -g agentverify" so each check starts faster, then run protect again.',
     '',
   ].join('\n'))
   return 0

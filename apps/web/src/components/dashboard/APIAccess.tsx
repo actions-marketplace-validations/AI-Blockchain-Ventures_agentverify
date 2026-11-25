@@ -1,24 +1,29 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { doc, getDoc, setDoc } from 'firebase/firestore'
 import { db } from '@/lib/firebase'
 import { useAuth } from '@/components/auth/AuthProvider'
 import { trackAPIPage } from '@/lib/analytics'
-import { copyToClipboard } from '@/lib/clipboard'
+import { copyToClipboard, selectTextIn } from '@/lib/clipboard'
+import { isRetiredApiKey } from '@/lib/apiKeyRetirement'
 
 const installCommand = 'npm install -g agentverify'
 
 export function APIAccess() {
   const { user } = useAuth()
   const [apiKey, setApiKey] = useState<string | null>(null)
+  const [keyCreatedAt, setKeyCreatedAt] = useState<unknown>(null)
   const [keyLoading, setKeyLoading] = useState(true)
   const [keyError, setKeyError] = useState<string | null>(null)
-  const [keyCopied, setKeyCopied] = useState(false)
-  const [installCopied, setInstallCopied] = useState(false)
-  const [scanCopied, setScanCopied] = useState(false)
+  // What each Copy button shows: copied, or "press Ctrl+C" when the browser refused (the text is then selected).
+  const [copyState, setCopyState] = useState<Record<string, 'ok' | 'manual'>>({})
+  const keyRef = useRef<HTMLInputElement>(null)
+  const installRef = useRef<HTMLPreElement>(null)
+  const scanRef = useRef<HTMLPreElement>(null)
 
-  const scanCommand = `agentverify scan . --key ${apiKey ?? 'YOUR_KEY'}`
+  const keyRetired = apiKey !== null && isRetiredApiKey(keyCreatedAt)
+  const scanCommand = `agentverify scan . --key ${apiKey && !keyRetired ? apiKey : 'YOUR_KEY'}`
 
   useEffect(() => { trackAPIPage() }, [])
   useEffect(() => {
@@ -28,7 +33,10 @@ export function APIAccess() {
     }
     setKeyLoading(true)
     getDoc(doc(db, 'users', user.uid, 'apiKeys', 'default'))
-      .then(snap => setApiKey(snap.exists() ? String(snap.data().key) : null))
+      .then(snap => {
+        setApiKey(snap.exists() ? String(snap.data().key) : null)
+        setKeyCreatedAt(snap.exists() ? snap.data().createdAt : null)
+      })
       .finally(() => setKeyLoading(false))
   }, [user])
 
@@ -71,6 +79,8 @@ export function APIAccess() {
       }
 
       setApiKey(newKey)
+      setKeyCreatedAt(createdAt)
+      window.dispatchEvent(new Event('agentverify:api-key-changed'))
     } catch (err) {
       console.error('Key generation error:', err)
       setKeyError('Failed to generate key. Please try again.')
@@ -79,27 +89,15 @@ export function APIAccess() {
     }
   }
 
-  const copyKey = async () => {
-    if (!apiKey) return
-    if (await copyToClipboard(apiKey)) {
-      setKeyCopied(true)
-      setTimeout(() => setKeyCopied(false), 2000)
-    }
+  const copy = async (which: string, text: string | null, element: HTMLElement | null) => {
+    if (!text) return
+    const ok = await copyToClipboard(text)
+    if (!ok) selectTextIn(element)
+    setCopyState(s => ({ ...s, [which]: ok ? 'ok' : 'manual' }))
+    setTimeout(() => setCopyState(s => { const next = { ...s }; delete next[which]; return next }), ok ? 2000 : 5000)
   }
-
-  const copyInstall = async () => {
-    if (await copyToClipboard(installCommand)) {
-      setInstallCopied(true)
-      setTimeout(() => setInstallCopied(false), 2000)
-    }
-  }
-
-  const copyScan = async () => {
-    if (await copyToClipboard(scanCommand)) {
-      setScanCopied(true)
-      setTimeout(() => setScanCopied(false), 2000)
-    }
-  }
+  const copyLabel = (which: string, idle: string) => (copyState[which] === 'ok' ? '✓ Copied' : copyState[which] === 'manual' ? 'Press Ctrl+C' : idle)
+  const copyColor = (which: string) => (copyState[which] === 'ok' ? 'var(--accent-green-text)' : copyState[which] === 'manual' ? 'var(--accent-orange-text)' : undefined)
 
   return (
     <div className="mx-auto max-w-2xl space-y-5">
@@ -110,10 +108,22 @@ export function APIAccess() {
 
         {keyLoading ? (
           <div style={{ backgroundColor: 'var(--input-bg)' }} className="h-10 animate-pulse rounded-lg" />
+        ) : keyRetired ? (
+          <div role="alert" style={{ border: '1px solid var(--accent-orange-text)' }} className="rounded-2xl p-4">
+            <p style={{ color: 'var(--text-primary)' }} className="text-sm font-semibold">This key was retired for security</p>
+            <p style={{ color: 'var(--text-secondary)' }} className="mt-1 text-xs leading-relaxed">
+              On November 24, 2026 we found and fixed a problem that let API keys be read by others, and retired every key made before the fix. Your old key no longer works. Create a new one, then update it wherever you use it: your terminal, CI, and the <code className="font-mono">AGENTVERIFY_API_KEY</code> setting for Agent Guard.
+            </p>
+            <p style={{ color: 'var(--text-muted)' }} className="mt-2 truncate font-mono text-xs line-through" aria-label="Retired key">{apiKey}</p>
+            <button onClick={generateKey} className="mt-3 w-full rounded-2xl bg-[#7C3AED] py-3 font-semibold text-white transition-colors hover:bg-[#6D28D9]">
+              Create new key
+            </button>
+          </div>
         ) : apiKey ? (
           <>
             <div className="flex flex-col gap-2 sm:flex-row">
               <input
+                ref={keyRef}
                 readOnly
                 aria-label="API key"
                 value={apiKey}
@@ -121,11 +131,12 @@ export function APIAccess() {
                 className="min-w-0 flex-1 rounded-lg px-4 py-2.5 font-mono text-sm text-[color:var(--accent-cyan-text)] outline-none"
               />
               <button
-                onClick={copyKey}
-                style={{ border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
-                className="min-w-[70px] rounded-lg px-4 py-2.5 text-sm transition-colors hover:opacity-70"
+                onClick={() => copy('key', apiKey, keyRef.current)}
+                aria-live="polite"
+                style={{ border: '1px solid var(--border)', color: copyColor('key') ?? 'var(--text-secondary)' }}
+                className="min-w-[110px] rounded-lg px-4 py-2.5 text-sm transition-colors hover:opacity-70"
               >
-                {keyCopied ? '✓ Copied' : 'Copy'}
+                {copyLabel('key', 'Copy')}
               </button>
             </div>
             <p style={{ color: 'var(--text-muted)' }} className="mt-2 text-xs">Never share this key or commit it to version control.</p>
@@ -155,25 +166,27 @@ export function APIAccess() {
 
         <p style={{ color: 'var(--text-muted)' }} className="mb-2 text-xs font-medium uppercase tracking-wider">Install</p>
         <div className="relative">
-          <pre tabIndex={0} role="region" aria-label="Install command" style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)' }} className="overflow-x-auto rounded-lg px-4 py-3 pr-16 font-mono text-sm text-[color:var(--accent-purple-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#06B6D4]">{installCommand}</pre>
+          <pre ref={installRef} tabIndex={0} role="region" aria-label="Install command" style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)' }} className="overflow-x-auto rounded-lg px-4 py-3 pr-16 font-mono text-sm text-[color:var(--accent-purple-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#06B6D4]">{installCommand}</pre>
           <button
-            onClick={copyInstall}
-            style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)', color: 'var(--text-muted)' }}
+            onClick={() => copy('install', installCommand, installRef.current)}
+            aria-live="polite"
+            style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)', color: copyColor('install') ?? 'var(--text-muted)' }}
             className="absolute right-2 top-2 rounded px-2 py-1 text-xs transition-colors hover:opacity-70"
           >
-            {installCopied ? '✓' : 'Copy'}
+            {copyLabel('install', 'Copy')}
           </button>
         </div>
 
         <p style={{ color: 'var(--text-muted)' }} className="mb-2 mt-4 text-xs font-medium uppercase tracking-wider">Scan</p>
         <div className="relative">
-          <pre tabIndex={0} role="region" aria-label="Scan command" style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)' }} className="overflow-x-auto rounded-lg px-4 py-3 pr-16 font-mono text-sm text-[color:var(--accent-purple-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#06B6D4]">{scanCommand}</pre>
+          <pre ref={scanRef} tabIndex={0} role="region" aria-label="Scan command" style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)' }} className="overflow-x-auto rounded-lg px-4 py-3 pr-16 font-mono text-sm text-[color:var(--accent-purple-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#06B6D4]">{scanCommand}</pre>
           <button
-            onClick={copyScan}
-            style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)', color: 'var(--text-muted)' }}
+            onClick={() => copy('scan', scanCommand, scanRef.current)}
+            aria-live="polite"
+            style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)', color: copyColor('scan') ?? 'var(--text-muted)' }}
             className="absolute right-2 top-2 rounded px-2 py-1 text-xs transition-colors hover:opacity-70"
           >
-            {scanCopied ? '✓' : 'Copy'}
+            {copyLabel('scan', 'Copy')}
           </button>
         </div>
 

@@ -2,6 +2,39 @@
 
 All notable changes to the `agentverify` CLI/SDK package are documented here.
 
+## [2.1.5] - 2026-11-24
+
+### Added
+- `agentverify log`: see what the guard blocked or asked about on this computer, newest first. Every decision is saved in `~/.agentverify/guard-log.jsonl` with secrets masked, with or without an account. `--all` adds allowed actions, `-n` shows more, `--json` for scripts, `--path` prints where the log is. The log never leaves the computer, rolls over at about 1 MB (one older copy kept), and `AGENTVERIFY_LOCAL_LOG=off` turns it off.
+- `protect` now says where to see what was blocked.
+
+## [2.1.4] - 2026-11-24
+
+### Changed
+- The npm page now starts with `agentverify protect`, the guard for Claude Code and Cursor: what it blocks, what it asks about, and which files it writes. No code changes.
+
+## [2.1.3] - 2026-11-24
+
+### Fixed
+- `protect` no longer prints a Node.js DeprecationWarning (DEP0190) on newer Node versions when it checks the installed agentverify version.
+
+## [2.1.2] - 2026-11-24
+
+### Fixed
+
+- `protect` only points the hooks at an installed `agentverify` when it reports this exact version. An old global
+  install (for example 1.4.0, which has no `hook` command) is no longer wired in, which would have made the guard
+  silently do nothing. `protect` now says when an older version is installed and how to update it.
+- Docs and the dashboard now say `npx agentverify@latest protect`, so `npx` fetches the newest version even when an
+  older one is installed globally. Found in a live test.
+
+## [2.1.1] - 2026-11-24
+
+### Fixed
+
+- Cursor: a block by the Claude Code hook (which Cursor also runs) now shows up on the Agent Guard dashboard. Before,
+  the block stopped the action before Cursor's own hook ran, so nothing recorded it. Found in a live test.
+
 ## [2.1.0] - 2026-11-23
 
 ### Added
